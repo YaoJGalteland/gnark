@@ -72,6 +72,10 @@ func (b *BlueprintGenericHint) NbOutputs(inst Instruction) int {
 	return 0
 }
 
+func (b *BlueprintGenericHint) SolveCost() int {
+	return 50
+}
+
 func (b *BlueprintGenericHint) UpdateInstructionTree(inst Instruction, tree InstructionTree) Level {
 	// BlueprintGenericHint knows the input and output to the instruction
 	maxLevel := LevelUnset

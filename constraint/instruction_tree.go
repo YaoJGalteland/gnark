@@ -54,6 +54,7 @@ func (system *System) InsertWire(wireID uint32, level Level) {
 	if system.lbWireLevel[wireID] != LevelUnset {
 		panic("wire already exist in instruction tree")
 	}
+	//print("\ninsert wire ", wireID, " at level ", level)
 
 	system.lbWireLevel[wireID] = level
 }

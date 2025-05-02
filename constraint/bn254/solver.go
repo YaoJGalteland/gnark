@@ -418,6 +418,7 @@ func (solver *solver) run() error {
 	// sequentially without sync.
 	const minWorkPerCPU = 50.0 // TODO @gbotrel revisit that with blocks.
 
+
 	// cs.Levels has a list of levels, where all constraints in a level l(n) are independent
 	// and may only have dependencies on previous levels
 	// for each constraint
@@ -455,14 +456,23 @@ func (solver *solver) run() error {
 	}()
 
 	var scratch scratch
+	sequentialRoundsCount := 0
+	parallellRoundsCount := 0
 
+	print("solver.Levels: ", len(solver.Levels))
 	// for each level, we push the tasks
 	for _, level := range solver.Levels {
 
-		// max CPU to use
-		maxCPU := float64(len(level)) / minWorkPerCPU
+		totalLevelWeight := 0
 
-		if maxCPU <= 1.0 || solver.nbTasks == 1 {
+		for _, i := range level {
+            // Access the cost using the instruction index iID from the System's InstructionCosts slice
+            totalLevelWeight += solver.System.InstructionCosts[i]
+        }
+
+		if totalLevelWeight < minWorkPerCPU || solver.nbTasks == 1 {
+			sequentialRoundsCount++
+
 			// we do it sequentially
 			for _, i := range level {
 				if err := solver.processInstruction(solver.Instructions[i], &scratch); err != nil {
@@ -472,14 +482,22 @@ func (solver *solver) run() error {
 			continue
 		}
 
+		parallellRoundsCount++
+		// --- Parallel Processing for this level ---
+
+
 		// number of tasks for this level is set to number of CPU
 		// but if we don't have enough work for all our CPU, it can be lower.
 		nbTasks := solver.nbTasks
-		maxTasks := int(math.Ceil(maxCPU))
+		maxTasks := int(math.Ceil(float64(totalLevelWeight)/minWorkPerCPU))
 		if nbTasks > maxTasks {
 			nbTasks = maxTasks
 		}
-		nbIterationsPerCpus := len(level) / nbTasks
+
+		
+		nbIterationsPerCpus := int(totalLevelWeight) / nbTasks
+        
+		targetTaskWeight := totalLevelWeight / (nbTasks)
 
 		// more CPUs than tasks: a CPU will work on exactly one iteration
 		// note: this depends on minWorkPerCPU constant
@@ -488,22 +506,62 @@ func (solver *solver) run() error {
 			nbTasks = len(level)
 		}
 
-		extraTasks := len(level) - (nbTasks * nbIterationsPerCpus)
-		extraTasksOffset := 0
+		// Distribute instructions into tasks based on accumulated estimated weight
+       
+        levelStartIdx := 0 // Track position in the levelIndices slice
 
-		for i := 0; i < nbTasks; i++ {
+
+
+		for taskIdx := 0; taskIdx < nbTasks; taskIdx++ {
+            chunkStartIdx := levelStartIdx
+            chunkEndIdx := chunkStartIdx // Will be updated
+
+            // Accumulate instructions until target weight is reached or end of level
+            accumulatedWeight := 0
+            // Iterate through the remaining instructions in this level
+            for i := chunkStartIdx; i < len(level); i++ {
+                 iID := level[i] // Get the global instruction index
+                 instructionWeight := solver.System.InstructionCosts[iID] // Get its estimated cost
+
+                 accumulatedWeight += instructionWeight
+                 chunkEndIdx = i + 1 // The end index is one past the current instruction
+
+                 // Cut off if target weight reached AND we're not stuck on a single very heavy instruction
+                 // or if it's the last task and we've accumulated some weight.
+                 if (accumulatedWeight >= targetTaskWeight && i > chunkStartIdx) ||
+                    (taskIdx == nbTasks-1 && accumulatedWeight > 0 && i == len(level)-1) {
+                      break // Stop accumulating for this task chunk
+                 }
+            }
+
+            // Handle edge case: if a single instruction's weight exceeds targetTaskWeight,
+            // it still forms a single task. Or if it's the last task and there's remaining work.
+            // Ensure at least one instruction if there's work left in the levelIndices slice
+             if chunkEndIdx == chunkStartIdx && chunkStartIdx < len(level) {
+                  chunkEndIdx = chunkStartIdx + 1 // Take at least the next instruction
+             } else if taskIdx == nbTasks - 1 && chunkEndIdx < len(level) {
+                  // Ensure the last task gets all remaining instructions
+                  chunkEndIdx = len(level)
+             }
+
+
+            // Extract the chunk of instruction indices for this task
+            // Need to copy the slice to avoid workers modifying the same underlying array segment concurrently
+            //taskInstructionIndices := make([]uint32, chunkEndIdx-chunkStartIdx)
+            //copy(taskInstructionIndices, level[chunkStartIdx:chunkEndIdx])
 			wg.Add(1)
-			_start := i*nbIterationsPerCpus + extraTasksOffset
-			_end := _start + nbIterationsPerCpus
-			if extraTasks > 0 {
-				_end++
-				extraTasks--
-				extraTasksOffset++
-			}
-			// since we're never pushing more than num CPU tasks
-			// we will never be blocked here
-			chTasks <- level[_start:_end]
-		}
+			chTasks <- level[chunkStartIdx:chunkEndIdx]
+			levelStartIdx = chunkEndIdx // Update the starting index for the next task from this level
+
+			
+
+        
+
+            // If we've used all instructions in the level, break the task loop
+            if levelStartIdx >= len(level) {
+                 break
+            }
+        }
 
 		// wait for the level to be done
 		wg.Wait()
@@ -513,6 +571,8 @@ func (solver *solver) run() error {
 		}
 	}
 
+	print("\nsequential rounds: ", sequentialRoundsCount)
+	print("\nparallel rounds: ", parallellRoundsCount)
 	if int(solver.nbSolved) != len(solver.values) {
 		return errors.New("solver didn't assign a value to all wires")
 	}

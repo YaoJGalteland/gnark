@@ -22,6 +22,15 @@ type Blueprint interface {
 	// since the blue print knows which wires it references, it updates
 	// the instruction tree with the level of the (new) wires.
 	UpdateInstructionTree(inst Instruction, tree InstructionTree) Level
+
+	// SolveCost returns an estimated measure of the computational effort
+	// required by the solver to process an instruction using this blueprint.
+	// This estimate can be relative (e.g., 1 for a simple R1C,
+	// a higher value for more complex operations or hints).
+	// The value should be non-negative.
+	// (e.g., if a Multiplication blueprint returns 1.0 and a Poseidon hash hint blueprint returns 50.0,
+	// it implies the hint is estimated to be 50 times more expensive to solve than a multiplication).
+	SolveCost() int
 }
 
 // Solver represents the state of a constraint system solver at runtime. Blueprint can interact

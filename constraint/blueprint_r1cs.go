@@ -17,6 +17,10 @@ func (b *BlueprintGenericR1C) NbOutputs(inst Instruction) int {
 	return 0
 }
 
+func (b *BlueprintGenericR1C) SolveCost() int {
+	return 1
+}
+
 func (b *BlueprintGenericR1C) CompressR1C(c *R1C, to *[]uint32) {
 	// we store total nb inputs, len L, len R, len O, and then the "flatten" linear expressions
 	nbInputs := 4 + 2*(len(c.L)+len(c.R)+len(c.O))

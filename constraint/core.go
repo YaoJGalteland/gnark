@@ -12,6 +12,7 @@ import (
 	"github.com/consensys/gnark/constraint/solver"
 	"github.com/consensys/gnark/debug"
 	"github.com/consensys/gnark/internal/smallfields"
+	"github.com/consensys/gnark/internal/smallfields/tinyfield"
 	"github.com/consensys/gnark/internal/utils"
 	"github.com/consensys/gnark/logger"
 	"github.com/consensys/gnark/profile"
@@ -81,9 +82,10 @@ type System struct {
 
 	Type SystemType
 
-	Instructions []PackedInstruction `cbor:"-"`
-	Blueprints   []Blueprint
-	CallData     []uint32 `cbor:"-"`
+	Instructions     []PackedInstruction `cbor:"-"`
+	InstructionCosts []int
+	Blueprints       []Blueprint
+	CallData         []uint32 `cbor:"-"`
 
 	// can be != than len(instructions)
 	NbConstraints int
@@ -202,7 +204,7 @@ func (system *System) CheckSerializationHeader() error {
 		return fmt.Errorf("when parsing serialized modulus: %s", system.ScalarField)
 	}
 	curveID := utils.FieldToCurve(scalarField)
-	if curveID == ecc.UNKNOWN && !(smallfields.IsSmallField(scalarField)) {
+	if curveID == ecc.UNKNOWN && !(smallfields.IsSmallField(scalarField) || scalarField.Cmp(tinyfield.Modulus()) == 0) {
 		return fmt.Errorf("unsupported scalar field %s", scalarField.Text(16))
 	}
 	system.q = new(big.Int).Set(scalarField)
@@ -407,9 +409,20 @@ func (cs *System) AddInstruction(bID BlueprintID, calldata []uint32) []uint32 {
 	// add the instruction
 	cs.Instructions = append(cs.Instructions, pi)
 
+	// --- NEW: Calculate and store the estimated solving cost ---
+	estimatedCost := blueprint.SolveCost()
+	//print(estimatedCost, " ")
+	cs.InstructionCosts = append(cs.InstructionCosts, estimatedCost)
+
+	//print("cost len", uint32(len(cs.InstructionCosts)), " ")
+
+	// --------------------------------------------------------
+
 	// update the instruction dependency tree
 	level := blueprint.UpdateInstructionTree(inst, cs)
 	iID := uint32(len(cs.Instructions) - 1)
+
+	//println("level", level, "iID", iID)
 
 	// we can't skip levels, so appending is fine.
 	if int(level) >= len(cs.Levels) {

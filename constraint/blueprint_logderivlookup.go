@@ -96,6 +96,10 @@ func (b *BlueprintLookupHint[E]) NbConstraints() int {
 	return 0
 }
 
+func (b *BlueprintLookupHint[E]) SolveCost() int {
+	return 1
+}
+
 // NbOutputs return the number of output wires this blueprint creates.
 func (b *BlueprintLookupHint[E]) NbOutputs(inst Instruction) int {
 	return int(inst.Calldata[2])

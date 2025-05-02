@@ -28,6 +28,10 @@ func (b *BlueprintGenericSparseR1C[E]) NbOutputs(inst Instruction) int {
 	return 0
 }
 
+func (b *BlueprintGenericSparseR1C[E]) SolveCost() int {
+	return 1
+}
+
 func (b *BlueprintGenericSparseR1C[E]) UpdateInstructionTree(inst Instruction, tree InstructionTree) Level {
 	return updateInstructionTree(inst.Calldata[0:3], tree)
 }
@@ -167,6 +171,9 @@ func (b *BlueprintSparseR1CMul[E]) NbConstraints() int {
 func (b *BlueprintSparseR1CMul[E]) NbOutputs(inst Instruction) int {
 	return 0
 }
+func (b *BlueprintSparseR1CMul[E]) SolveCost() int {
+	return 1
+}
 
 func (b *BlueprintSparseR1CMul[E]) UpdateInstructionTree(inst Instruction, tree InstructionTree) Level {
 	return updateInstructionTree(inst.Calldata[0:3], tree)
@@ -211,7 +218,9 @@ func (b *BlueprintSparseR1CAdd[E]) NbConstraints() int {
 func (b *BlueprintSparseR1CAdd[E]) NbOutputs(inst Instruction) int {
 	return 0
 }
-
+func (b *BlueprintSparseR1CAdd[E]) SolveCost() int {
+	return 1
+}
 func (b *BlueprintSparseR1CAdd[E]) UpdateInstructionTree(inst Instruction, tree InstructionTree) Level {
 	return updateInstructionTree(inst.Calldata[0:3], tree)
 }
@@ -267,6 +276,9 @@ func (b *BlueprintSparseR1CBool[E]) UpdateInstructionTree(inst Instruction, tree
 
 func (b *BlueprintSparseR1CBool[E]) CompressSparseR1C(c *SparseR1C, to *[]uint32) {
 	*to = append(*to, c.XA, c.QL, c.QM)
+}
+func (b *BlueprintSparseR1CBool[E]) SolveCost() int {
+	return 1
 }
 
 func (blueprint *BlueprintSparseR1CBool[E]) Solve(s Solver[E], inst Instruction) error {
