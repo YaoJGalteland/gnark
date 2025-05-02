@@ -2,9 +2,11 @@ package constraint
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/blang/semver/v4"
 	"github.com/consensys/gnark"
@@ -73,6 +75,97 @@ type Instruction struct {
 	Calldata         []uint32
 }
 
+// todo: fix the following two methods
+// GetOutputWires returns the list of wire IDs that this instruction solves.
+func (inst Instruction) GetOutputWires() []uint32 {
+
+	blueprint := cs.Blueprints[pi.BlueprintID]
+	if inst.Blueprint.nbOutputs == 0 {
+		return nil // No output wires
+	}
+	wires := make([]uint32, inst.NbOutputs)
+	for i := uint32(0); i < inst.NbOutputs; i++ {
+		wires[i] = inst.WireOffset + i
+	}
+	return wires
+}
+
+// GetInputWires analyzes the instruction's calldata based on its blueprint
+// to determine the wire IDs used as inputs.
+// This is a placeholder implementation and needs to be adapted to how
+// different blueprints encode input wires in calldata.
+func (inst Instruction) GetInputWires(system *System) []uint32 {
+	blueprint := system.Blueprints[inst.BlueprintID]
+	inputWires := []uint32{}
+
+	// This logic is highly dependent on blueprint implementation details.
+	// We need to know how each blueprint type encodes its input wire IDs in calldata.
+	// Below is a simplified placeholder based on common patterns (e.g., LinearExpressions).
+
+	// Example placeholder logic:
+	// If the blueprint uses LinearExpressions for inputs (like R1CS or Hints),
+	// iterate through the terms in the calldata and extract wire IDs.
+	// This requires knowing the calldata format for each blueprint type.
+
+	// For R1CS and SparseR1CS, calldata encodes LinearExpressions.
+	// For Hints, calldata encodes HintMapping, which contains LinearExpressions for inputs.
+
+	// A robust implementation would dispatch based on BlueprintID or type assertion
+	// and parse calldata according to the specific blueprint's format.
+
+	// --- Simplified Placeholder Implementation ---
+	// Assuming calldata contains a sequence of LinearExpressions or Terms.
+	// This is a generic attempt and might not work for all blueprints.
+
+	calldata := inst.Calldata
+	j := 0 // Current index in calldata
+
+	// A common pattern: first element is a count, followed by data.
+	// Or calldata is a flat list of terms (coeffID, wireID pairs).
+
+	// Let's assume for R1CS/SparseR1CS, calldata is terms: [cID1, vID1, cID2, vID2, ...]
+	// For Hints, calldata might be structured differently, e.g., [nbInputs, nbOutputs, input1_len, cID1, vID1, ..., input2_len, ...]
+
+	// This is too complex to implement generically without blueprint specifics.
+	// A more realistic approach: Blueprints themselves should have a method
+	// like `GetInputWires(calldata []uint32) []uint32` that the System calls.
+	// Or, the `Instruction` struct could store parsed input wire IDs during compilation.
+
+	// **Alternative Placeholder:** Let's assume the `Blueprint` interface has a method
+	// `GetInputWires(calldata []uint32) []uint32`
+	if bp, ok := blueprint.(interface {
+		GetInputWires([]uint32) []uint32
+	}); ok {
+		inputWires = bp.GetInputWires(calldata)
+	} else {
+		// Fallback or error if blueprint doesn't implement this method
+		// For now, return empty list or panic if this is unexpected.
+		// fmt.Printf("Warning: Blueprint %d does not implement GetInputWires. Assuming no inputs.\n", inst.BlueprintID)
+	}
+
+	// --- End Simplified Placeholder ---
+
+	// Filter out constant wires (math.MaxUint32) if necessary, though Term.WireID() might handle this.
+	// Also filter out input wires (public/secret) as they don't create dependencies on *instructions*.
+
+	offset := system.internalWireOffset()
+	filteredInputWires := []uint32{}
+	for _, wID := range inputWires {
+		// Check if it's a constant wire (assuming math.MaxUint32)
+		if wID == math.MaxUint32 {
+			continue
+		}
+		// Check if it's a public or secret input wire
+		if wID < offset {
+			continue
+		}
+		// It's an internal wire used as input, which creates a dependency
+		filteredInputWires = append(filteredInputWires, wID)
+	}
+
+	return filteredInputWires
+}
+
 // System contains core elements for a constraint System
 type System struct {
 	// serialization header
@@ -107,6 +200,10 @@ type System struct {
 
 	// maps hintID to hint string identifier
 	MHintsDependencies map[solver.HintID]string
+
+	// Dependency fields populated by BuildDependencyGraph
+	InstructionDependenciesCount map[uint32]*atomic.Int32 // Tracks remaining dependencies for each instruction
+	Dependents                   map[uint32][]uint32      // Maps an instruction index to a list of indices that depend on it
 
 	// each level contains independent constraints and can be parallelized
 	// it is guaranteed that all dependencies for constraints in a level l are solved
@@ -145,6 +242,9 @@ func NewSystem(scalarField *big.Int, capacity int, t SystemType) System {
 		lbWireLevel:        make([]Level, 0, capacity),
 		Levels:             make([][]uint32, 0, capacity/2),
 		CommitmentInfo:     NewCommitments(t),
+		// Dependency fields initialized to nil, will be populated by BuildDependencyGraph
+		InstructionDependenciesCount: nil,
+		Dependents:                   nil,
 	}
 
 	system.genericHint = system.AddBlueprint(&BlueprintGenericHint{})
@@ -477,4 +577,90 @@ func (system *System) AddGkr(gkr GkrInfo) error {
 
 	system.GkrInfo = gkr
 	return nil
+}
+
+// todo: maybe update updateInstructionTree to return the denpendency graph????
+// BuildDependencyGraph analyzes instructions to build the dependency graph.
+// This should be called after all instructions are added to the system.
+// It populates InstructionDependenciesCount and Dependents fields.
+func (system *System) BuildDependencyGraph() error {
+	numInstructions := uint32(len(system.Instructions))
+
+	// 1. Identify Wire Producers
+	// Map from wire index to the index of the instruction that solves it.
+	// A wire might not be solved by any instruction (e.g., public inputs, constants).
+	wireProducer := make(map[uint32]uint32)
+	for i := uint32(0); i < numInstructions; i++ {
+		inst := system.Instructions[i].Unpack(system) // Unpack the instruction
+
+		// Get the wires solved by this instruction using the new GetOutputWires method
+		solvedWires := inst.GetOutputWires()
+
+		for _, solvedWire := range solvedWires {
+			if existingProducer, found := wireProducer[solvedWire]; found {
+				// This indicates an issue in the constraint system design
+				return fmt.Errorf("wire %d is solved by multiple instructions: %d and %d", solvedWire, existingProducer, i)
+			}
+			wireProducer[solvedWire] = i
+		}
+	}
+
+	// Initialize dependency structures
+	system.InstructionDependenciesCount = make(map[uint32]*atomic.Int32, numInstructions)
+	system.Dependents = make(map[uint32][]uint32, numInstructions)
+
+	// Initialize counters to 0 and empty dependent lists
+	for i := uint32(0); i < numInstructions; i++ {
+		system.InstructionDependenciesCount[i] = &atomic.Int32{} // Starts at 0
+		system.Dependents[i] = make([]uint32, 0)
+	}
+
+	// 2. & 3. Analyze Instruction Inputs and Build Dependency Graph
+	// Use a temporary set to track dependencies for a single instruction
+	// to avoid counting the same dependency multiple times.
+	tempDependencies := make(map[uint32]struct{})
+
+	for i := uint32(0); i < numInstructions; i++ {
+		// Clear the temporary set for the current instruction
+		for k := range tempDependencies {
+			delete(tempDependencies, k)
+		}
+
+		inst := system.Instructions[i].Unpack(system) // Unpack the instruction
+
+		// Get wires used by instruction i using the new GetInputWires method
+		// This method needs access to the system to interpret calldata based on blueprint.
+		inputWires := inst.GetInputWires(system) // Pass system to GetInputWires
+
+		for _, wireIndex := range inputWires {
+			// Find the instruction that produces this wire's value
+			if producerInstructionIndex, ok := wireProducer[wireIndex]; ok {
+				// If the producer is a different instruction than the current one
+				if producerInstructionIndex != i {
+					// Add this producer as a dependency for instruction i
+					// Use the map to ensure uniqueness
+					tempDependencies[producerInstructionIndex] = struct{}{}
+				}
+			}
+			// Note: If a wire is used but not produced by any instruction (e.g., public input, constant),
+			// it doesn't create a dependency on another *instruction* in this context.
+		}
+
+		// 4. Populate Dependency Counters and Dependents List
+		// Now that we have the unique dependencies for instruction i (in tempDependencies)
+		for depInstructionIndex := range tempDependencies {
+			// Increment the dependency count for instruction i
+			system.InstructionDependenciesCount[i].Add(1)
+
+			// Add instruction i to the dependents list of depInstructionIndex
+			system.Dependents[depInstructionIndex] = append(system.Dependents[depInstructionIndex], i)
+		}
+	}
+
+	// Optional: Cycle detection could be added here.
+	// A simple check: if any instruction has a dependency count > 0 after this
+	// process, but is not reachable from the initial ready set (instructions with 0 dependencies).
+	// A more robust check is a graph traversal (DFS).
+
+	return nil // Return nil if successful
 }

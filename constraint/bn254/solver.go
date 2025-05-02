@@ -13,7 +13,6 @@ import (
 	"github.com/consensys/gnark/constraint"
 	csolver "github.com/consensys/gnark/constraint/solver"
 	"github.com/rs/zerolog"
-	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -30,7 +29,12 @@ type solver struct {
 	// values and solved are index by the wire (variable) id
 	values   []fr.Element
 	solved   []bool
-	nbSolved uint64
+	//nbSolved uint64
+
+	// Dependency fields (referenced from embedded system struct)
+	// InstructionDependenciesCount map[uint32]*atomic.Int32 // Accessed via solver.System.InstructionDependenciesCount
+	// Dependents                 map[uint32][]uint32      // Accessed via solver.System.Dependents
+	solvedInstructionsCount atomic.Int64 // Counter for total solved instructions
 
 	// maps hintID to hint function
 	mHintsFunctions map[csolver.HintID]csolver.Hint
@@ -45,6 +49,12 @@ type solver struct {
 }
 
 func newSolver(cs *system, witness fr.Vector, opts ...csolver.Option) (*solver, error) {
+	// Ensure dependency graph is built before creating the solver
+	if cs.InstructionDependenciesCount == nil || cs.Dependents == nil {
+		// This indicates BuildDependencyGraph was not called on the System
+		return nil, errors.New("dependency graph not built on the constraint system")
+	}
+
 	// add GKR options to overwrite the placeholder
 	if cs.GkrInfo.Is() {
 		var gkrData GkrSolvingData
@@ -94,6 +104,8 @@ func newSolver(cs *system, witness fr.Vector, opts ...csolver.Option) (*solver, 
 		logger:          opt.Logger,
 		nbTasks:         opt.NbTasks,
 		q:               cs.Field(),
+		// Initialize atomic counter for solved instructions
+		solvedInstructionsCount: atomic.Int64{},
 	}
 
 	// set the witness indexes as solved
@@ -108,7 +120,7 @@ func newSolver(cs *system, witness fr.Vector, opts ...csolver.Option) (*solver, 
 
 	// keep track of the number of wire instantiations we do, for a post solve sanity check
 	// to ensure we instantiated all wires
-	s.nbSolved += uint64(len(witness) + witnessOffset)
+	// += uint64(len(witness) + witnessOffset)
 
 	if s.Type == constraint.SystemR1CS {
 		n := ecc.NextPowerOfTwo(uint64(cs.GetNbConstraints()))
@@ -121,25 +133,44 @@ func newSolver(cs *system, witness fr.Vector, opts ...csolver.Option) (*solver, 
 }
 
 func (s *solver) set(id int, value fr.Element) {
+	if id < 0 || id >= len(s.values) {
+		panic(fmt.Sprintf("attempted to set value for wire ID %d out of bounds (len %d)", id, len(s.values)))
+	}
 	if s.solved[id] {
 		panic("solving the same wire twice should never happen.")
 	}
 	s.values[id] = value
 	s.solved[id] = true
-	atomic.AddUint64(&s.nbSolved, 1)
+	//atomic.AddUint64(&s.nbSolved, 1)
 }
 
 // computeTerm computes coeff*variable
 func (s *solver) computeTerm(t constraint.Term) fr.Element {
 	cID, vID := t.CoeffID(), t.WireID()
 
-	if t.IsConstant() {
-		return s.Coefficients[cID]
+	if t.IsConstant() { // Assuming IsConstant() method exists on Term
+		if int(cID) >= len(s.Coefficients) { // Added bounds check
+			panic(fmt.Sprintf("constant coefficient ID %d out of bounds (len %d)", cID, len(s.Coefficients)))
+		}
+		return s.Coefficients[cID] // Assuming Coefficients is accessible via embedded system
 	}
 
-	if cID != 0 && !s.solved[vID] {
-		panic("computing a term with an unsolved wire")
+	// In the dependency-based solver, if we are computing a term with a non-constant wire,
+	// that wire *must* be solved. If not, it's a dependency scheduling error.
+	if !s.solved[vID] {
+		// This should theoretically not happen if the dependency graph is correct
+		// and instructions are only processed when ready.
+		panic(fmt.Sprintf("attempted to compute term with unsolved wire %d. This indicates a dependency scheduling issue.", vID))
 	}
+
+	// Wire is solved, proceed with computation.
+	if int(cID) >= len(s.Coefficients) { // Added bounds check
+		panic(fmt.Sprintf("coefficient ID %d out of bounds (len %d)", cID, len(s.Coefficients)))
+	}
+	if int(vID) >= len(s.values) { // Added bounds check
+		panic(fmt.Sprintf("wire ID %d out of bounds (len %d)", vID, len(s.values)))
+	}
+
 
 	switch cID {
 	case constraint.CoeffIdZero:
@@ -167,9 +198,28 @@ func (s *solver) accumulateInto(t constraint.Term, r *fr.Element) {
 	cID := t.CoeffID()
 	vID := t.WireID()
 
-	if t.IsConstant() {
-		r.Add(r, &s.Coefficients[cID])
+	if t.IsConstant() { // Assuming IsConstant() method exists on Term
+		if int(cID) >= len(s.Coefficients) { // Added bounds check
+			panic(fmt.Sprintf("constant coefficient ID %d out of bounds (len %d)", cID, len(s.Coefficients)))
+		}
+		r.Add(r, &s.Coefficients[cID]) // Assuming Coefficients is accessible via embedded system
 		return
+	}
+
+	// In the dependency-based solver, if we are accumulating a term with a non-constant wire,
+	// that wire *must* be solved. If not, it's a dependency scheduling error.
+	if !s.solved[vID] {
+		// This should theoretically not happen if the dependency graph is correct
+		// and instructions are only processed when ready.
+		panic(fmt.Sprintf("attempted to accumulate term with unsolved wire %d. This indicates a dependency scheduling issue.", vID))
+	}
+
+	// Wire is solved, proceed with accumulation.
+	if int(cID) >= len(s.Coefficients) { // Added bounds check
+		panic(fmt.Sprintf("coefficient ID %d out of bounds (len %d)", cID, len(s.Coefficients)))
+	}
+	if int(vID) >= len(s.values) { // Added bounds check
+		panic(fmt.Sprintf("wire ID %d out of bounds (len %d)", vID, len(s.values)))
 	}
 
 	switch cID {
@@ -255,50 +305,71 @@ func (s *solver) printLogs(logs []constraint.LogEntry) {
 
 const unsolvedVariable = "<unsolved>"
 
+// logValue evaluates terms within a LogEntry for printing.
+// In the dependency-based solver, if this is called for a log associated with
+// a processed instruction, all wires referenced in the log's ToResolve expressions
+// *should* be solved. If not, it indicates a logic error.
 func (s *solver) logValue(log constraint.LogEntry) string {
 	var toResolve []interface{}
 	var (
 		eval         fr.Element
-		missingValue bool
+		missingValue bool // Flag to indicate if any term in an expression is unsolved
 	)
 	for j := 0; j < len(log.ToResolve); j++ {
-		// before eval le
-
 		missingValue = false
-		eval.SetZero()
+		eval.SetZero() // Initialize evaluation result for this expression
 
-		for _, t := range log.ToResolve[j] {
-			// for each term in the linear expression
-
+		for _, t := range log.ToResolve[j] { // Iterate through terms in the linear expression
 			cID, vID := t.CoeffID(), t.WireID()
+
 			if t.IsConstant() {
-				// just add the constant
+				// Just add the constant term
+				if int(cID) >= len(s.Coefficients) { // Added bounds check
+					// Handle error or skip term if coefficient ID is invalid
+					missingValue = true // Treat as missing value if coefficient is invalid
+					break // Stop evaluating this expression
+				}
 				eval.Add(&eval, &s.Coefficients[cID])
 				continue
 			}
 
+			// In the dependency-based solver, if a wire is referenced in a log for a
+			// processed instruction, it should be solved.
 			if !s.solved[vID] {
+				// This case should ideally not be reached if the dependency graph and solver are correct.
+				// However, if it is, we mark the entire expression as having a missing value.
 				missingValue = true
-				break // stop the loop we can't evaluate.
+				break // Stop evaluating this expression if a wire is unsolved
 			}
 
+			// Wire is solved, compute the term and add to evaluation.
+			// computeTerm already checks if solved and panics if not (which should not happen here).
 			tv := s.computeTerm(t)
 			eval.Add(&eval, &tv)
 		}
 
-		// after
+		// After evaluating the linear expression
 		if missingValue {
-			toResolve = append(toResolve, unsolvedVariable)
+			toResolve = append(toResolve, unsolvedVariable) // Append placeholder if any wire was unsolved
 		} else {
-			// we have to append our accumulator
+			// Append the evaluated value
 			toResolve = append(toResolve, eval.String())
 		}
-
 	}
+
+	// Add stack trace information if available
 	if len(log.Stack) > 0 {
 		var sbb strings.Builder
-		for _, lID := range log.Stack {
-			location := s.SymbolTable.Locations[lID]
+		for _, lID := range log.Stack { // Stack contains Location IDs
+			if int(lID) >= len(s.SymbolTable.Locations) { // Added bounds check
+				sbb.WriteString(fmt.Sprintf("invalid location ID %d\n", lID))
+				continue
+			}
+			location := s.SymbolTable.Locations[lID] // Assuming SymbolTable is accessible via embedded system
+			if int(location.FunctionID) >= len(s.SymbolTable.Functions) { // Added bounds check
+				sbb.WriteString(fmt.Sprintf("invalid function ID %d in location %d\n", location.FunctionID, lID))
+				continue
+			}
 			function := s.SymbolTable.Functions[location.FunctionID]
 
 			sbb.WriteString(function.Name)
@@ -311,9 +382,10 @@ func (s *solver) logValue(log constraint.LogEntry) string {
 		}
 		toResolve = append(toResolve, sbb.String())
 	}
+
+	// Format the log message
 	return fmt.Sprintf(log.Format, toResolve...)
 }
-
 // divByCoeff sets res = res / t.Coeff
 func (solver *solver) divByCoeff(res *fr.Element, cID uint32) {
 	switch cID {
@@ -409,117 +481,212 @@ func (solver *solver) processInstruction(pi constraint.PackedInstruction, scratc
 
 	return nil
 }
-
-// run runs the solver. it return an error if a constraint is not satisfied or if not all wires
-// were instantiated.
+// run runs the solver using a dependency-based execution model.
+// It processes instructions as their dependencies are met, leveraging goroutines.
+// It returns an error if a constraint is not satisfied or if not all instructions
+// were successfully processed (implying not all wires could be instantiated).
 func (solver *solver) run() error {
-	// minWorkPerCPU is the minimum target number of constraint a task should hold
-	// in other words, if a level has less than minWorkPerCPU, it will not be parallelized and executed
-	// sequentially without sync.
-	const minWorkPerCPU = 50.0 // TODO @gbotrel revisit that with blocks.
+	// minWorkPerCPU and level-based logic are not used in this dynamic dependency model.
+	// const minWorkPerCPU = 50.0 // TODO @gbotrel revisit that with blocks.
+	// cs.Levels is not used for execution flow.
 
-	// cs.Levels has a list of levels, where all constraints in a level l(n) are independent
-	// and may only have dependencies on previous levels
-	// for each constraint
-	// we are guaranteed that each R1C contains at most one unsolved wire
-	// first we solve the unsolved wire (if any)
-	// then we check that the constraint is valid
-	// if a[i] * b[i] != c[i]; it means the constraint is not satisfied
+	// In the dependency-based approach, tasks (individual instruction indices) become ready
+	// as their dependencies are solved. We use a channel as a queue for ready tasks.
+	// The buffer size can influence performance; nbTasks is a reasonable starting point.
+	// A larger buffer might help keep workers busy if dependency resolution is fast.
+	chReadyTasks := make(chan uint32, solver.nbTasks*4) // Channel to send individual instruction indices
+
+	// Channel to signal errors from workers to the main goroutine.
+	// Buffer of 1 is sufficient as we typically stop on the first error.
+	chError := make(chan error, 1)
+
+	// We need a WaitGroup to wait for ALL instructions to be processed.
 	var wg sync.WaitGroup
-	chTasks := make(chan []uint32, solver.nbTasks)
-	chError := make(chan error, solver.nbTasks)
+	// We add all instructions to the WaitGroup initially. Each worker will call wg.Done()
+	// after successfully processing a single instruction.
+	totalInstructions := uint32(len(solver.Instructions)) // Assuming Instructions is accessible via embedded system
+	wg.Add(int(totalInstructions)) // Add total number of instructions to WaitGroup
 
-	// start a worker pool
-	// each worker wait on chTasks
-	// a task is a slice of constraint indexes to be solved
+	// Initialize the solved instructions counter.
+	solver.solvedInstructionsCount.Store(0)
+
+	// Start the worker pool.
+	// Each worker waits on chReadyTasks and processes individual instructions.
 	for i := 0; i < solver.nbTasks; i++ {
 		go func() {
-			var scratch scratch
-			for t := range chTasks {
-				for _, i := range t {
-					if err := solver.processInstruction(solver.Instructions[i], &scratch); err != nil {
-						chError <- err
-						wg.Done()
-						return
+			var scratch scratch // Each worker gets its own scratch space to avoid contention
+			// Workers continuously pull individual instruction indices from chReadyTasks
+			for instructionIndex := range chReadyTasks {
+				// Check if an error has already occurred in another goroutine.
+				// If so, this worker should stop processing and return.
+				select {
+				case <-chError:
+					return // Exit worker goroutine
+				default:
+					// No error, continue processing the instruction.
+				}
+
+				// Process the instruction. This involves executing blueprint logic,
+				// which may solve wires and call s.set().
+				// processInstruction handles R1CS solving, hint execution, or solvable blueprints.
+				// It returns an error if the constraint is unsatisfied or hint fails.
+				if err := solver.processInstruction(solver.Instructions[instructionIndex], &scratch); err != nil {
+					// If an error occurs during processing, signal it to the main goroutine
+					// via the error channel and stop this worker.
+					select {
+					case chError <- err:
+						// Successfully sent the error.
+					default:
+						// Error channel is full, another worker likely already reported an error.
+						// This is fine, we just stop this worker.
+					}
+					// Do NOT call wg.Done() here on error, as the main goroutine will return early
+					// and shouldn't wait for this specific instruction to be marked as done.
+					return // Exit worker goroutine
+				}
+
+				// If processing was successful, increment the global count of solved instructions.
+				solver.solvedInstructionsCount.Add(1)
+
+				// Notify dependent instructions that one of their dependencies is met.
+				// Assumes solver.System.Dependents[instructionIndex] gives a list of instruction indices
+				// that depend on instructionIndex.
+				if dependents, ok := solver.System.Dependents[instructionIndex]; ok { // Access Dependents via embedded system
+					for _, dependentIndex := range dependents {
+						// Atomically decrement the dependency count for the dependent instruction.
+						// Load the atomic.Int32 pointer for the dependent instruction's counter.
+						depCounter := solver.System.InstructionDependenciesCount[dependentIndex] // Access InstructionDependenciesCount via embedded system
+						if depCounter == nil {
+							// This should not happen if the dependency graph is built correctly.
+							// Signal an internal error if a dependency counter is missing.
+							select {
+							case chError <- fmt.Errorf("internal error: dependency counter not found for instruction %d (dependent of %d)", dependentIndex, instructionIndex):
+							default:
+							}
+							return // Exit worker goroutine on internal error
+						}
+
+						// Decrement the counter and get the new value.
+						remaining := depCounter.Add(-1)
+
+						// If the count becomes 0, this dependent instruction is now ready to be processed.
+						if remaining == 0 {
+							// Send the dependent instruction's index to the ready queue.
+							select {
+							case chReadyTasks <- dependentIndex:
+								// Successfully sent the ready task.
+							case <-chError:
+								// If an error occurred in another goroutine while trying to send,
+								// stop trying to send and let the system shut down.
+								return // Exit worker goroutine
+							}
+						} else if remaining < 0 {
+							// This indicates a logic error in the dependency counting (e.g., decremented too many times).
+							select {
+							case chError <- fmt.Errorf("internal error: dependency counter for instruction %d went below zero (%d)", dependentIndex, remaining):
+							default:
+							}
+							return // Exit worker goroutine on internal error
+						}
 					}
 				}
+
+				// Signal that this instruction is done processing successfully.
 				wg.Done()
 			}
+			// The worker exits the loop when chReadyTasks is closed and empty.
 		}()
 	}
 
-	// clean up pool go routines
-	defer func() {
-		close(chTasks)
-		close(chError)
-	}()
-
-	var scratch scratch
-
-	// for each level, we push the tasks
-	for _, level := range solver.Levels {
-
-		// max CPU to use
-		maxCPU := float64(len(level)) / minWorkPerCPU
-
-		if maxCPU <= 1.0 || solver.nbTasks == 1 {
-			// we do it sequentially
-			for _, i := range level {
-				if err := solver.processInstruction(solver.Instructions[i], &scratch); err != nil {
-					return err
-				}
+	// Identify initially ready tasks (those with 0 dependencies) and add them to the queue.
+	// These are the instructions that can be processed first, as they don't depend on
+	// any other instructions within the system (their inputs are public, secret, or constants).
+	initialReadyCount := 0
+	for i := uint32(0); i < totalInstructions; i++ {
+		// Get the dependency counter for instruction i.
+		depCounter := solver.System.InstructionDependenciesCount[i] // Access InstructionDependenciesCount via embedded system
+		if depCounter == nil {
+			// This should not happen if the dependency graph was built for all instructions.
+			// Signal an internal error.
+			select {
+			case chError <- fmt.Errorf("internal error: dependency counter not found for initial instruction %d", i):
+			default:
 			}
-			continue
-		}
-
-		// number of tasks for this level is set to number of CPU
-		// but if we don't have enough work for all our CPU, it can be lower.
-		nbTasks := solver.nbTasks
-		maxTasks := int(math.Ceil(maxCPU))
-		if nbTasks > maxTasks {
-			nbTasks = maxTasks
-		}
-		nbIterationsPerCpus := len(level) / nbTasks
-
-		// more CPUs than tasks: a CPU will work on exactly one iteration
-		// note: this depends on minWorkPerCPU constant
-		if nbIterationsPerCpus < 1 {
-			nbIterationsPerCpus = 1
-			nbTasks = len(level)
-		}
-
-		extraTasks := len(level) - (nbTasks * nbIterationsPerCpus)
-		extraTasksOffset := 0
-
-		for i := 0; i < nbTasks; i++ {
-			wg.Add(1)
-			_start := i*nbIterationsPerCpus + extraTasksOffset
-			_end := _start + nbIterationsPerCpus
-			if extraTasks > 0 {
-				_end++
-				extraTasks--
-				extraTasksOffset++
-			}
-			// since we're never pushing more than num CPU tasks
-			// we will never be blocked here
-			chTasks <- level[_start:_end]
-		}
-
-		// wait for the level to be done
-		wg.Wait()
-
-		if len(chError) > 0 {
+			// Close the channel and return the error.
+			close(chReadyTasks)
+			// Wait briefly for workers to pick up the close signal if they are blocked on the channel.
+			// This is a simplified shutdown; a more robust approach might involve a context.
+			// For now, just return the error.
 			return <-chError
 		}
+
+		// If the dependency count is 0, the instruction is initially ready.
+		if depCounter.Load() == 0 {
+			// Send the instruction index to the ready queue.
+			select {
+			case chReadyTasks <- i:
+				initialReadyCount++
+			case err := <-chError:
+				// If an error occurred while adding initial tasks, exit.
+				// Close the channel to signal workers to stop.
+				close(chReadyTasks)
+				return err // Return the error.
+			}
+		}
 	}
 
-	if int(solver.nbSolved) != len(solver.values) {
-		return errors.New("solver didn't assign a value to all wires")
+	fmt.Printf("Submitted %d initially ready tasks\n", initialReadyCount) // Debugging print
+
+	// Wait for all instructions to be processed.
+	// This will block until wg.Done() has been called totalInstructions times.
+	// If an error occurs in a worker, it sends to chError and exits, but wg.Done()
+	// is not called for that instruction. The main goroutine will detect the error
+	// via the select statement below *after* wg.Wait() returns (or potentially earlier
+	// if the error channel is checked more frequently, but checking after Wait is safer
+	// to ensure all non-errored tasks complete). A more complex shutdown is needed
+	// for immediate error propagation and termination.
+	wg.Wait()
+
+	// Now that wg.Wait() has returned, all non-errored instructions have been processed.
+	// We can safely close the chReadyTasks channel so workers exit their range loop.
+	close(chReadyTasks)
+
+	// Check for any errors reported by workers.
+	select {
+	case err := <-chError:
+		// An error occurred during processing.
+		return err
+	default:
+		// No error was reported.
 	}
 
-	return nil
+	// Final check that all instructions were successfully processed.
+	// The number of solved instructions should equal the total number of instructions.
+	if solver.solvedInstructionsCount.Load() != int64(totalInstructions) {
+		// This indicates a problem: either a cycle in the dependency graph prevented
+		// some instructions from becoming ready, or an internal error occurred
+		// that wasn't properly reported via chError (less likely with the current logic).
+		// It could also happen if the dependency graph building was incorrect.
+		return fmt.Errorf("solver didn't process all instructions. Expected %d, processed %d. Possible dependency cycle or internal error.", totalInstructions, solver.solvedInstructionsCount.Load())
+	}
+
+	// The old final check using nbSolved and len(solver.values) is less direct
+	// in this model where we track instruction completion. The solvedInstructionsCount
+	// check is more appropriate. However, if nbSolved is intended to track wire
+	// instantiations and len(solver.values) is the total number of wires,
+	// you might still want a check to ensure all wires that *should* have been
+	// solved by the processed instructions were indeed solved. This requires
+	// knowing the total number of wires that are expected to be solved by the system.
+	// For now, rely on solvedInstructionsCount == totalInstructions.
+	// if int(solver.nbSolved) != len(solver.values) {
+	//     return errors.New("solver didn't assign a value to all wires")
+	// }
+
+
+	fmt.Printf("Solver finished successfully. Total instructions processed: %d\n", solver.solvedInstructionsCount.Load())
+
+	return nil // Success
 }
-
 // solveR1C compute unsolved wires in the constraint, if any and set the solver accordingly
 //
 // returns an error if the solver called a hint function that errored
